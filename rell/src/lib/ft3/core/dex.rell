@@ -1,0 +1,608 @@
+import acc: lib.ft3.account;
+import core: lib.ft3.core;
+import lib.ft3.ft3_basic_dev;
+
+
+entity pair{
+    id: byte_array;
+    key id;
+    key asset1:byte_array, asset2:byte_array;
+    mutable amount1: decimal;
+    mutable amount2: decimal;
+    key lp_token: core.asset;
+    mutable lp_supply:decimal;
+    mutable k_last:decimal;
+}
+
+entity dex_transaction_history{
+  key transaction;
+  acc.account;
+}
+
+struct swap_price {
+  current_price: decimal;
+  quote: decimal;
+}
+
+function sqrt(x: decimal): decimal {
+    require(x >= 0);
+    var w=1.0;
+    while (w*w < x) w*=10;
+
+    var r=0.0;
+    while (r*r != x and w>0) {
+        while ((r+w)*(r+w) <= x) r+=w;
+        w/=10;
+    }
+    return r;
+}
+
+query test_greater_than(id1: byte_array, id2: byte_array) : integer {
+  if(id1 > id2) return 1;
+  else if (id1 < id2) return 2;
+  else return 0;
+}
+query get_user_number() : integer{
+  return (acc.account@*{}).size();
+}
+
+query get_pair_number() : integer{
+  return (pair@*{}).size();
+}
+
+query get_tx_number() : integer{
+  return (transaction@*{}).size();
+}
+
+
+
+
+query get_dex_history_count(acc_id:byte_array){
+  // function to get the number of transactions of a user 
+  var count = dex_transaction_history @* {.account.id == acc_id} (@sum 1);
+  return count;
+}
+
+
+query get_pairs(){
+  return pair@*{}(
+    asset1=.asset1,
+    asset2=.asset2,
+    amount1=.amount1,
+    amount2=.amount2,
+    lp_token=.lp_token.id,
+    lp_supply=.lp_supply
+  );
+}
+
+query get_circulating_value_in(asset_ID: byte_array): decimal{
+  var tot_amount = decimal(0);
+  for (p in pair @* {}) {
+    tot_amount += (p.amount1 * get_theoretical_price(asset_ID, p.asset1));
+    tot_amount += (p.amount2 * get_theoretical_price(asset_ID, p.asset2));
+  }
+  return tot_amount;
+}
+
+query get_price(first:byte_array, second:byte_array, amount: decimal) : swap_price{
+  require(first != second, "Both tokens cannot be same");
+  val (reserve1, reserve2)= get_reserves(first, second);
+  require(reserve1 > 0 and reserve2 > 0, "Insufficent Liquidity");
+  val k = reserve1 * reserve2;
+  val reserveQuote = reserve1 + amount;
+  val reservePrice = reserve1 + 1;
+  val quote = (((reserve2- k/reserveQuote)*997)/1000);
+  val price = (((reserve2- k/reservePrice)*997)/1000);
+  return swap_price(current_price=price, quote=quote);
+}
+
+query get_dex_history(acc_id: byte_array, _offset:integer, _limit:integer){
+// offset and limit are used for pagination,limit shows how many number of transactions to be shown in one page,and offset shows the number of transactions to be skipped
+
+  return dex_transaction_history@*{.account.id == acc_id}(
+    tx_rid = .transaction.tx_rid,
+    tx_data = .transaction.tx_data,
+    tx_hash = .transaction.tx_hash,
+    timestamp = .transaction.block.timestamp
+  ) offset _offset limit _limit;
+}
+
+function record_transaction(account: acc.account){
+  create dex_transaction_history(op_context.transaction, account);
+}
+
+
+function get_theoretical_price(id_numerator:byte_array, id_denominator:byte_array): decimal{ //0 if pool for these coins doesn't exist
+  if (id_numerator == id_denominator){return decimal(1);}
+  var p = pair @? {.asset1 == id_numerator, .asset2 == id_denominator};
+  if (p??){
+    return p.amount1/p.amount2;
+  } else {
+    p = pair @? {.asset2 == id_numerator, .asset1 == id_denominator};
+    if (p??){
+      return p.amount2/p.amount1;
+    }
+  }
+  return decimal(0);//TODO: should we add routing through different pools? Should we calc selling price instead? (selling 1000 in a pool of 1000 would give half the value)
+}
+
+
+
+operation add_liq(_first:byte_array, _second:byte_array, _amount1:decimal, _amount2:decimal, auth_id:byte_array, acc_id:byte_array){
+    val account = acc.auth_and_log(acc_id, auth_id, ["T"]);
+    record_transaction(account);
+    require(_amount1>0 and _amount2>0, "Liquidity must be greater than 0");
+    var first = _first; var second = _second; var amount1 = _amount1; var amount2 = _amount2;
+    var p = pair@?{.asset1==first, .asset2==second};
+    if (not p??) { // when there is no liqudity ,first time your adding
+        p=pair@?{.asset1==second, .asset2==first};
+        if (not p??) {
+
+
+            //This could be a separate op "create_liq" but calling ops inside ops isn't allowed outside REPL. The first three requires would be needed if separated
+            //val account = acc.auth_and_log(acc_id, auth_id, ["T"]);
+            //require(not pair@?{.asset1==first, .asset2==second}??);
+            //require(not pair@?{.asset1==second, .asset2==first}??);
+            //require(amount1>0 and amount2>0);
+            val start_lp = sqrt(amount1*amount2);
+            require(start_lp >= 1000, "Insufficent Initial Liquidity");
+            val bal1 = core.balance @ {.account.id == account.id,.asset.id == first};
+            val bal2 = core.balance @ {.account.id == account.id,.asset.id == second};
+            require(bal1.amount>=amount1, "Insufficent balance for first token");
+            require(bal2.amount>=amount2, "Insufficent balance for second token");
+            bal1.amount-=amount1;bal2.amount-=amount2;//should trigger an update
+            val lp = core.register_lp_asset("Chr-LP " +core.asset@{.id==first}.name+"-"+core.asset@{.id==second}.name, "Chr-LP", chain_context.blockchain_rid);
+            // create pair(asset1=first, asset2=second, amount1=amount1, amount2=amount2, lp_token=lp, lp_supply=start_lp);//, k=amount1*amount2);
+            core.ensure_balance(account, lp).amount += start_lp - 1000;//it should trigger an update; -1000 to have min liq (uniswapv2 wp)
+
+            return; //Don't add liq twice when creating a pool
+        }
+        first=second;   second=_first;
+        amount1=amount2;amount2=_amount1;
+    }
+    val bal1 = core.balance @ {.account.id == account.id,.asset.id == first};
+    val bal2 = core.balance @ {.account.id == account.id,.asset.id == second};
+
+    val k1=amount1/p.amount1;
+    val k2=amount2/p.amount2;
+
+    if (k1 == k2){
+
+    } else if (k1 < k2){
+        amount2= k1*p.amount2;
+    } else if (k1>k2){
+        amount1= k2*p.amount2;
+    }
+    require(bal1.amount>=amount1, "Insufficent balance for first token");
+    require(bal2.amount>=amount2, "Insufficent balance for second token");
+    bal1.amount -= amount1;  bal2.amount -= amount2; //should trigger an update
+    p.amount1 += amount1; p.amount2 += amount2;
+    val lp_bal = core.ensure_balance(account, p.lp_token);
+    val added_liq = p.lp_supply*min(k1, k2);
+    lp_bal.amount += added_liq;
+    p.lp_supply += added_liq;
+}
+
+operation remove_liq(_first:byte_array, _second:byte_array, _amount1:decimal, _amount2:decimal, auth_id:byte_array, acc_id:byte_array){
+    val account = acc.auth_and_log(acc_id, auth_id, ["T"]);
+    record_transaction(account);
+    require(_amount1>0 and _amount2>0);
+    var first = _first; var second = _second; var amount1 = _amount1; var amount2 = _amount2;
+    var p = pair@?{.asset1==first, .asset2==second};
+    if (not p??) {
+        p=pair@{.asset1==second, .asset2==first};
+        first=second;second=_first;
+        amount1=amount2;amount2=_amount1;
+    }
+    val bal1 = core.ensure_balance(account, core.asset@{.id==first});
+    val bal2 = core.ensure_balance(account, core.asset@{.id==second});
+    val lp_bal = core.balance @ {.account.id == account.id,.asset.id == p.lp_token.id};
+
+    val lp1 = (amount1*p.lp_supply/p.amount1);  val lp2 = (amount2*p.lp_supply/p.amount2);
+    var lp = decimal(0);
+    if (lp1 > lp2) {
+        lp = lp2;
+        amount1=lp*p.amount1/p.lp_supply;
+    } else {
+        lp = lp1;
+        amount2=lp*p.amount2/p.lp_supply;
+    }
+
+    require(lp_bal.amount >= lp);
+    lp_bal.amount -= lp;
+
+    p.amount1-=amount1; p.amount2-=amount2;      //
+    bal1.amount+=amount1;  bal2.amount+=amount2;//should trigger an update
+    p.lp_supply -= lp;                         //
+}
+
+operation swap_old(from:byte_array, to:byte_array, amount:decimal, amount_min:decimal, deadline:timestamp, auth_id:byte_array, acc_id:byte_array){
+    val account = acc.auth_and_log(acc_id, auth_id, ["T"]);
+    record_transaction(account);
+    require(amount>0, "Amount must be greater than 0");
+    var p = pair@?{.asset1==from, .asset2==to};
+    var inverted = false;
+    if (not p??) {
+        p=pair@{.asset1==to, .asset2==from};
+        inverted=true;
+    }
+    val from_bal = core.balance @ {.account.id == account.id,.asset.id == from};
+    val to_bal = core.ensure_balance(account, core.asset@{.id==to});
+    require(from_bal.amount >= amount, "Insufficent Balance");
+    from_bal.amount -= amount;
+    var to_am = decimal(0);
+    val k = p.amount1*p.amount2;
+    if (inverted) {
+        p.amount2 += amount;
+        to_am = (((p.amount1 - k/p.amount2)*997)/1000);
+        p.amount1 -= to_am;
+    } else {
+        p.amount1 += amount;
+        to_am = (((p.amount2 - k/p.amount1)*997)/1000);
+        p.amount2 -= to_am;
+    }
+    print(to_am);
+    print(amount_min);
+    require(to_am>0 and to_am>amount_min, "Minimum Amount Out should be smaller");
+    to_bal.amount += to_am;
+    require(op_context.last_block_time<=deadline,"Transaction took longer than deadline");
+}
+
+operation add_liquidity(_tokenA : byte_array, _tokenB: byte_array, _amountADesired: decimal, _amountBDesired: decimal, _amountAMin: decimal, _amountBMin:decimal, deadline:timestamp, auth_id:byte_array, acc_id:byte_array) {
+
+   print("add liquidity");
+
+  val account = acc.auth_and_log(acc_id, auth_id, ["T"]);
+   print("add liquidity1");
+  record_transaction(account); //dex transaction history adding
+   print("add liquidity2");
+  // sort tokens and amounts to maintain idempotency
+  var (tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin) = sort_add_liq_args(_tokenA, _tokenB, _amountADesired, _amountBDesired, _amountAMin, _amountBMin);
+  
+  // make sure enough balance is available
+  print("make sure enough balance is available");
+  val balA = core.balance @ {.account.id == account.id,.asset.id == tokenA};
+  val balB = core.balance @ {.account.id == account.id,.asset.id == tokenB};
+  require(balA.amount>=amountADesired, "Insufficent balance for token "+balA.asset.name);
+  require(balB.amount>=amountBDesired, "Insufficent balance for token "+balB.asset.name);
+  print("make sure enough after balance is available");
+  
+  // calculate actual amount to add liquidity
+  var (p, amountA, amountB) = _add_liquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);
+  var (reserveA, reserveB) = get_reserves(tokenA, tokenB);
+  print("amountA = " + amountA + " amountB = " + amountB );
+  print("reserveA = " + reserveA + " reserveB = " + reserveB );
+  // Mint Fee
+  var _kLast = p.k_last;
+  if (_kLast != 0) {
+    var rootK = sqrt(reserveA * reserveB);
+    var rootKLast = sqrt(_kLast);
+    if (rootK > rootKLast) {
+      var numerator = p.lp_supply * (rootK - rootKLast) * 8;
+      var denominator = (rootK *17 ) + (rootKLast * 8);
+      var liquidity = numerator / denominator;
+      if (liquidity > 0) {
+        val lp_bal = core.ensure_balance(account, p.lp_token);//TODO: Do not use account instead use hardcoded account which should earn fee
+        lp_bal.amount += liquidity;
+        p.lp_supply += liquidity;
+      }
+    }
+  }
+
+  // Liquidity calculation
+  var totalSupply = p.lp_supply;
+  var liquidity = 0.0;
+  if(totalSupply == 0.0){
+    liquidity = sqrt(amountA * amountB) - 1000;
+    p.lp_supply += 1000;
+  } else {
+    var lp1 = amountA * totalSupply / reserveA;
+    var lp2 = amountB * totalSupply / reserveB;
+    if(lp1 > lp2) {
+      liquidity = lp2;
+    } else {
+      liquidity = lp1;
+    }
+  }
+  require(liquidity > 0, 'Insufficient liquidity');
+  val lp_bal = core.ensure_balance(account, p.lp_token);
+  lp_bal.amount += liquidity;
+  p.lp_supply += liquidity;
+  balA.amount -= amountA;  balB.amount -= amountB;
+  p.amount1 += amountA; p.amount2 += amountB;
+  p.k_last = p.amount1 * p.amount2;
+
+  require(op_context.last_block_time<=deadline,"Transaction took longer than deadline");
+ 
+}
+
+function _add_liquidity(tokenA : byte_array, tokenB: byte_array, amountADesired: decimal, amountBDesired: decimal, amountAMin: decimal, amountBMin:decimal) : (pair, decimal, decimal) {
+  var p = get_or_create_pair(tokenA, tokenB);
+  val (reserveA, reserveB)= get_reserves(tokenA, tokenB);
+  if (reserveA == 0.0 and reserveB == 0.0) {
+    print("Returning (p, amountADesired, amountBDesired)", p, amountADesired, amountBDesired);
+	  return (p, amountADesired, amountBDesired);
+  } else {
+    var amountBOptimal = quote(amountADesired, reserveA, reserveB);
+    if (amountBOptimal <= amountBDesired) {
+        require(amountBOptimal >= amountBMin, 'Insufficient B amount');
+        print("Returning (p, amountADesired, amountBOptimal)", p, amountADesired, amountBOptimal);
+        return (p, amountADesired, amountBOptimal);
+    } else {
+        var amountAOptimal = quote(amountBDesired, reserveB, reserveA);
+        require(amountAOptimal <= amountADesired, 'Insufficient A desired');
+        require(amountAOptimal >= amountAMin, 'Insufficient A amount');
+        print("Returning (p, amountAOptimal, amountBDesired)", p, amountAOptimal, amountBDesired);
+        return (p, amountAOptimal, amountBDesired);
+    }
+  } 
+}
+
+operation remove_liquidity(_tokenA : byte_array, _tokenB: byte_array, _liquidity: decimal, _amountAMin: decimal, _amountBMin:decimal, deadline:timestamp, auth_id:byte_array, acc_id:byte_array) {
+  val account = acc.auth_and_log(acc_id, auth_id, ["T"]);
+  record_transaction(account); //dex transaction history
+
+  // sort tokens and amounts to maintain idempotency
+  var (tokenA, tokenB, amountAMin, amountBMin) = sort_rem_liq_args(_tokenA, _tokenB, _amountAMin, _amountBMin);
+
+  var p = pair @? {.asset1 == tokenA, .asset2 == tokenB};
+  require(p, "Pair does not exist");
+
+  val balLiq = core.balance @ {.account.id == account.id, .asset.id == p.lp_token.id};
+  require(balLiq.amount>=_liquidity, "Insufficent balance for token "+balLiq.asset.name);
+
+  
+  var (reserveA, reserveB) = get_reserves(tokenA, tokenB);
+  // Mint Fee
+  var _kLast = p.k_last;
+  if (_kLast != 0) {
+    var rootK = sqrt(reserveA * reserveB);
+    var rootKLast = sqrt(_kLast);
+    if (rootK > rootKLast) {
+      var numerator = p.lp_supply * (rootK - rootKLast) * 8;
+      var denominator = (rootK *17 ) + (rootKLast * 8);
+      var liquidity = numerator / denominator;
+      if (liquidity > 0) {
+        val lp_bal = core.ensure_balance(account, p.lp_token);//TODO: Do not use account instead use hardcoded account which should earn fee
+        lp_bal.amount += liquidity;
+        p.lp_supply += liquidity;
+      }
+    }
+  }
+
+  var totalSupply = p.lp_supply;
+  var amountA = _liquidity * reserveA / totalSupply; // using balances ensures pro-rata distribution
+  var amountB = _liquidity * reserveB / totalSupply;
+
+  val balA = core.balance @ {.account.id == account.id,.asset.id == tokenA};
+  val balB = core.balance @ {.account.id == account.id,.asset.id == tokenB};
+  require(amountA > 0 and amountB > 0, 'Insufficient Liquidity');
+  require(amountA >= amountAMin, "Insufficent Amount for token "+balA.asset.name);
+  require(amountB >= amountBMin, "Insufficent Amount for token "+balB.asset.name);
+
+  balLiq.amount -= _liquidity;
+  balA.amount += amountA;  balB.amount += amountB;
+  p.lp_supply -= _liquidity;
+  p.amount1 -= amountA; p.amount2 -= amountB;
+  p.k_last = p.amount1 * p.amount2;
+
+  require(op_context.last_block_time<=deadline,"Transaction took longer than deadline");
+}
+
+
+operation swap(_tokenA:byte_array, _tokenB:byte_array, _amount_in:decimal, _amount_out_min:decimal, deadline:timestamp, auth_id:byte_array, acc_id:byte_array){
+  val account = acc.auth_and_log(acc_id, auth_id, ["T"]);
+  record_transaction(account); //dex transaction history
+  print("Amounts: " + _amount_in + " " + _amount_out_min);
+  var (tokenA,tokenB) = sort_tokens(_tokenA,_tokenB);
+  var p = pair@{.asset1 == tokenA, .asset2 == tokenB};
+
+  val from_bal = core.balance @ {.account.id == account.id,.asset.id == _tokenA};
+  val to_bal = core.ensure_balance(account, core.asset@{.id==_tokenB});
+  require(from_bal.amount>=_amount_in, "Insufficent balance for token "+from_bal.asset.name);
+
+  var inverted = false;
+  if(_tokenA == tokenA and _tokenB == tokenB){
+    inverted = false;
+  } else {
+    inverted = true;
+  }
+  print("Amount In: " + _amount_in);
+  var _amount_out = if (inverted) _get_amount_out(_amount_in, p.amount2, p.amount1) else _get_amount_out(_amount_in, p.amount1, p.amount2); 
+
+  print("Amount Out: " + _amount_out);
+  
+  require (_amount_out >= _amount_out_min, "Insufficient output amount");
+  from_bal.amount -= _amount_in;
+
+  if(inverted){
+    p.amount2 += _amount_in;
+    p.amount1 = max(p.amount1-_amount_out, 0);
+  } else {
+    p.amount1 += _amount_in;
+    p.amount2 = max(p.amount2-_amount_out, 0);
+  }
+
+  to_bal.amount += _amount_out;
+
+  require(op_context.last_block_time<=deadline,"Transaction took longer than deadline");
+}
+
+function _get_amount_out(_amount_in: decimal, reserve1: decimal, reserve2: decimal): decimal {
+  // require(_amount_in > 0, "Insufficent input amount");
+  require(reserve1 > 0 and reserve2 > 0, "Insufficent liquidity");
+  var amountInWithFee = _amount_in * 9975;
+  var numerator = amountInWithFee * reserve2;
+  var denominator = (reserve1 * 10000) + amountInWithFee;
+  return numerator / denominator;
+}
+
+function get_or_create_pair(_tokenA : byte_array, _tokenB: byte_array): pair{
+  var pairId = _get_pair_id(_tokenA, _tokenB);
+  print("pairId: " + pairId);
+  if(pairId == x''){
+    //create
+    val lp = core.register_lp_asset("Chr-LP " +core.asset@{.id==_tokenA}.name+"-"+core.asset@{.id==_tokenB}.name, "Chr-LP", chain_context.blockchain_rid);
+    pairId = (_tokenA, _tokenB).hash();
+    var p = create pair(id=pairId, asset1=_tokenA, asset2=_tokenB, amount1=0.0, amount2=0.0, lp_token=lp, lp_supply=0.0, k_last=0.0);//, k=amount1*amount2);
+    return p;
+  }
+  return pair @ {.id == pairId};
+}
+
+function _get_pair_id(_tokenA : byte_array, _tokenB: byte_array): (byte_array){
+  print("tokenA: " + _tokenA.to_hex() + " tokenB: " + _tokenB.to_hex());
+  var p = pair@?{.asset1 == _tokenA, .asset2 == _tokenB};
+  print("p: " + p);
+  if (p??){
+    print("pair exists");
+    return p.id;
+  } else {
+    return x'';
+  }
+}
+
+function sort_add_liq_args(_tokenA : byte_array, _tokenB: byte_array, _amountADesired: decimal, _amountBDesired: decimal, _amountAMin: decimal, _amountBMin:decimal):(byte_array, byte_array, decimal, decimal, decimal, decimal) {
+  var (tokenA,tokenB) = sort_tokens(_tokenA,_tokenB);
+  if(tokenA == _tokenA and tokenB == _tokenB){
+    return (tokenA, tokenB, _amountADesired, _amountBDesired, _amountAMin, _amountBMin);
+  } else {
+    return (tokenA, tokenB, _amountBDesired, _amountADesired, _amountBMin, _amountAMin);
+  }
+}
+
+function sort_rem_liq_args(_tokenA : byte_array, _tokenB: byte_array, _amountAMin: decimal, _amountBMin:decimal):(byte_array, byte_array, decimal, decimal) {
+  var (tokenA,tokenB) = sort_tokens(_tokenA,_tokenB);
+  if(tokenA == _tokenA and tokenB == _tokenB){
+    return (tokenA, tokenB, _amountAMin, _amountBMin);
+  } else {
+    return (tokenA, tokenB, _amountBMin, _amountAMin);
+  }
+}
+function sort_tokens(_tokenA : byte_array, _tokenB : byte_array) : (byte_array, byte_array){
+  //just normal sorting of the tokens based on thier lenght ,tokenA becomes the tokenB and tokenB becomes the tokenA, if tokenA is bigger than tokenB
+
+  require(_tokenA != _tokenB, "Tokens must be different");
+  var tokenA = _tokenA;
+  var tokenB = _tokenB;
+  if(_tokenA > _tokenB){
+    tokenA = _tokenB;
+    tokenB = _tokenA;
+  }
+  return (tokenA,tokenB);  
+}
+
+function get_reserves(first: byte_array, second: byte_array): (decimal, decimal) {
+  // retunns the two reserves asset amounts if exits else returns 0,0
+  var p = pair @? {.asset1 == first, .asset2 == second};
+  if (p??){ // check if the pair exists ,means pair is not null
+    return (p.amount1, p.amount2);
+  }
+  return (decimal(0),decimal(0)); // retuning 0,0 if pair does not exist
+}
+
+function quote(amountA : decimal, reserveA : decimal, reserveB : decimal): decimal {
+    require(amountA > 0, "Insufficient amount");
+    require(reserveA > 0 and reserveB > 0, "Insufficient liquidity");
+    return (amountA * reserveB) / reserveA;
+}
+
+query get_pair_text(a1:byte_array, a2:byte_array): text{
+  var (tokenA, tokenB) = sort_tokens(a1, a2);
+  var p = pair@?{.asset1 == tokenA, .asset2 == tokenB};
+  if (p??){
+    return '{"lp_id": "%s", '.format(p.lp_token.id.to_hex())+'"lp_supply": %f, '.format(p.lp_supply)+'"amount1": %f, '.format(p.amount1)+'"amount2": %f}'.format(p.amount2);
+  } else {
+    return "Invalid pair";
+  }
+}
+
+struct pair_info {
+  id: byte_array;
+  asset1: (id:byte_array,name:text,symbol:text,is_lp_token:boolean,issuing_chain_rid:byte_array);
+  asset2: (id:byte_array,name:text,symbol:text,is_lp_token:boolean,issuing_chain_rid:byte_array);
+  amount1: decimal;
+  amount2: decimal;
+  lp_token: (id:byte_array,name:text,symbol:text,is_lp_token:boolean,issuing_chain_rid:byte_array);
+  lp_supply: decimal;
+} 
+
+query get_pair_info(_tokenA:byte_array, _tokenB:byte_array){
+  // returns the pair info if exists else returns null(no record found err  )
+  var (tokenA, tokenB) = sort_tokens(_tokenA, _tokenB); // sorting the tokens if tokenA is bigger than tokenB
+
+  var p = pair@{.asset1 == tokenA, .asset2 == tokenB};
+
+  var pairInfo = pair_info( // creating the pair info struct
+    id= p.id,
+    asset1= core.asset@{.id==p.asset1}(.id,.name,.symbol,.is_lp_token,.issuing_chain_rid), // getting the asset info of the asset1
+    asset2= core.asset@{.id==p.asset2}(.id,.name,.symbol,.is_lp_token,.issuing_chain_rid),
+    amount1= p.amount1,
+    amount2= p.amount2,
+    lp_token= core.asset@{.id==p.lp_token.id}(.id,.name,.symbol,.is_lp_token,.issuing_chain_rid), // getting the asset info of the lp token
+    lp_supply= p.lp_supply
+  );
+
+  return pairInfo;
+}
+
+query get_pair_infos(acc_id:byte_array, _offset:integer, _limit:integer){
+  // paginated query to get the pair infos of the account, returns the list of pair infos
+  var lp_bals = core.balance @* {.account.id == acc_id,.asset.is_lp_token == true} offset _offset limit _limit;
+  var pairs =list<pair_info>();
+  for (lp_bal in lp_bals) {
+    var  p = pair@{.lp_token == lp_bal.asset};
+    var assetA = core.asset@{.id==p.asset1}(.id,.name,.symbol,.is_lp_token,.issuing_chain_rid);
+    var assetB = core.asset@{.id==p.asset2}(.id,.name,.symbol,.is_lp_token,.issuing_chain_rid);
+    var pairInfo = pair_info(
+      id= p.id,
+      asset1= core.asset@{.id==p.asset1}(.id,.name,.symbol,.is_lp_token,.issuing_chain_rid),
+      asset2= core.asset@{.id==p.asset2}(.id,.name,.symbol,.is_lp_token,.issuing_chain_rid),
+      amount1= p.amount1,
+      amount2= p.amount2,
+      lp_token= core.asset@{.id==p.lp_token.id}(.id,.name,.symbol,.is_lp_token,.issuing_chain_rid),
+      lp_supply= p.lp_supply
+    );
+    pairs.add(pairInfo);
+  }
+  return pairs;
+}
+
+query get_all_pairs(){
+  return pair@*{}(
+    pairId = .id,
+    reserve1 = .amount1,
+    reserve2 = .amount2
+  );
+}
+
+query get_pairs_count(acc_id:byte_array){
+  var count = core.balance @* {.account.id == acc_id,.asset.is_lp_token == true} (@sum 1);
+  return count;
+}
+
+query get_amount_out(_tokenA: byte_array, _tokenB: byte_array, _amount_in: decimal): decimal{
+  var (tokenA, tokenB) = sort_tokens(_tokenA, _tokenB);
+  val (reserve1, reserve2) = get_reserves(tokenA, tokenB);
+  if(_tokenA == tokenA and _tokenB == tokenB){
+    return _get_amount_out(_amount_in, reserve1, reserve2);
+  } else {
+    return _get_amount_out(_amount_in, reserve2, reserve1);
+  }
+}
+
+query get_price_and_quote(_tokenA: byte_array, _tokenB: byte_array, _amount_in: decimal): swap_price
+// used to get the current price and quote of a swap 
+{
+  var (tokenA, tokenB) = sort_tokens(_tokenA, _tokenB);
+  val (reserve1, reserve2)= get_reserves(tokenA, tokenB);
+  if(_tokenA == tokenA and _tokenB == tokenB){
+    var amount_out = _get_amount_out(_amount_in, reserve1, reserve2);
+    var price = _get_amount_out(1, reserve1, reserve2);
+    return swap_price(current_price=price, quote=amount_out); 
+  } else {
+    var amount_out = _get_amount_out(_amount_in, reserve2, reserve1);
+    var price = _get_amount_out(1, reserve2, reserve1);
+    return swap_price(current_price=price, quote=amount_out); 
+  }
+}

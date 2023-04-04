@@ -1,0 +1,19 @@
+module;
+
+import lf: lib.ft3.ft3_basic_dev;
+// import acc: lib.ft3.account; 
+//
+// entity user {
+//     key account: lf.ft3.acc.account;
+//     key username: text;
+// }
+// 
+// operation add_user(account_id: byte_array, auth_id: byte_array, username: text) {
+// 	val account = acc.account@{.id == account_id};
+// 	acc.require_auth(account, auth_id, ["T"]);
+// 	create user(account, username);
+// }
+// 
+// query get_username_by_account_id(account_id: byte_array) {
+// 	return user@?{acc.account@{ .id == account_id }}.username;
+// }

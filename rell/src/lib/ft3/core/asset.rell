@@ -1,0 +1,147 @@
+import acc: ^.account;
+
+entity asset {
+    id: byte_array;
+    key id;
+    key name;
+    symbol: text;
+    is_lp_token: boolean;
+    issuing_chain_rid: byte_array;
+}
+
+entity balance {
+    key acc.account, asset;
+    mutable amount: decimal = 0;
+}
+
+function ensure_balance(acc.account, asset): balance {
+    val balance = balance @? {asset, account};
+    if (balance != null) {
+       return balance;
+    }
+    else return create balance(account, asset, amount = decimal(0));
+}
+
+// creating and saving the asset to the database
+function register_asset (name, symbol: text, issuing_chain_rid: byte_array): asset {
+   val id = (name, issuing_chain_rid).hash(); // crate a hash of the name and chain id
+   return create asset (id, name, symbol, issuing_chain_rid, false); // create the asset and commiting it to the database
+}
+
+function register_lp_asset (name, symbol: text, issuing_chain_rid: byte_array): asset {
+   val id = (name, issuing_chain_rid).hash();
+   return create asset (id, name, symbol, issuing_chain_rid, true);
+}
+
+function _get_asset_balances(account_id: byte_array): list<(id:byte_array,name:text,symbol:text,amount:decimal,is_lp_token:boolean,chain_id:byte_array)> {
+    return balance @* { .account.id == account_id } (
+      id = .asset.id,
+      name = .asset.name,
+      symbol = .asset.symbol,
+      amount = .amount,
+      is_lp_token = .asset.is_lp_token,
+      chain_id = .asset.issuing_chain_rid
+    );  
+}
+
+query get_asset_balances(account_id: byte_array) {
+    return _get_asset_balances(account_id);
+}
+
+query get_all_asset_balances(is_lp_token:boolean) {
+    // retunns information about all the assets and their balances if the asset is lp token,asset is not lp token ,it will reuturn an empty list
+	return balance @*  {.asset.is_lp_token == is_lp_token } (
+      id = .asset.id,
+      name = .asset.name,
+      symbol = .asset.symbol,
+      amount = .amount,
+      is_lp_token = .asset.is_lp_token,
+      chain_id = .asset.issuing_chain_rid
+    );  
+}
+
+
+function _get_asset_balances_by_type(account_id: byte_array, is_lp_token:boolean): list<(id:byte_array,name:text,symbol:text,amount:decimal,is_lp_token:boolean,chain_id:byte_array)> {
+    return balance @* { .account.id == account_id, .asset.is_lp_token == is_lp_token } (
+      id = .asset.id,
+      name = .asset.name,
+      symbol = .asset.symbol,
+      amount = .amount,
+      is_lp_token = .asset.is_lp_token,
+      chain_id = .asset.issuing_chain_rid
+    );  
+}
+
+query get_asset_balances_by_type(account_id: byte_array, is_lp_token:boolean){
+    return _get_asset_balances_by_type(account_id, is_lp_token);
+}
+
+query get_asset_balance(account_id: byte_array, asset_id: byte_array) {
+    return balance @? {
+        .account.id == account_id,
+        .asset.id == asset_id
+    } (
+        id = .asset.id,
+        name = .asset.name,
+        symbol = .asset.symbol,
+        amount = .amount,
+        is_lp_token = .asset.is_lp_token,
+        chain_id = .asset.issuing_chain_rid
+    );
+}
+
+// function that takes the asset id and fetches the balance and crate an list of the balances and asset combined
+query get_token_list_info(){
+    var token_list_info = list<(id:byte_array,name:text,amount:decimal,chain_id:byte_array)>();
+    for (u in asset @* {}) {
+       var asset_bal=balance@*{.asset.id==u.id}; // get the balance of the asset using asset id
+         for (v in asset_bal){
+  token_list_info.add((id = u.id,name = u.name,amount = v.amount,chain_id = u.issuing_chain_rid)); // pushing both the asset and balance into a list
+        
+         }
+
+}
+    print(token_list_info,"this is the token list info");
+    return token_list_info;
+}
+
+
+query get_asset_by_name(name) {
+    return asset @* { name } (
+        .id,
+        .name,
+        .symbol,
+        .is_lp_token,
+        .issuing_chain_rid
+    );
+    
+}
+
+query get_asset_by_id(asset_id: byte_array) {
+	return asset@{
+		.id == asset_id
+	}(
+		id = .id,
+		name = .name,
+        symbol = .symbol,
+        is_lp_token = .is_lp_token,
+		issuing_chain_rid = .issuing_chain_rid
+	);
+}
+
+query get_all_assets() {
+	return asset@*{}(
+		id = .id,
+		name = .name,
+        symbol = .symbol,
+        is_lp_token = .is_lp_token,
+		issuing_chain_rid = .issuing_chain_rid	
+	);
+}
+
+
+function fetch_asset_by_id(asset_id: byte_array): asset {
+	return asset@{
+		.id == asset_id
+	};
+}

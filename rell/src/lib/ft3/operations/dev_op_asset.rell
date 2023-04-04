@@ -1,0 +1,19 @@
+@mount('ft3')
+module;
+
+import dev_op: ^^.core.dev_op;
+import ft3: ^^.core;
+
+import xft3: ^^.crosschain; 
+//function used to create token ,with symbol and initial symbol
+
+operation dev_register_asset (name, symbol:text, issuing_chain_rid: byte_array) {
+    dev_op.require_dev(); // default its set to true ,if set to false then it will not allow to create token
+    ft3.register_asset(name, symbol, issuing_chain_rid); // function responsible for creating token(Assets)
+}
+
+operation dev_register_xc_asset (name, symbol:text, issuing_chain_rid: byte_array, origin_chain_rid: byte_array) {
+    dev_op.require_dev();   
+    val asset = ft3.register_asset(name, symbol, issuing_chain_rid);
+    create xft3.asset_origin (asset, origin_chain_rid);
+}

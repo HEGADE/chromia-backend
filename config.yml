@@ -1,0 +1,15 @@
+blockchains:
+  "YOUR_CHAIN_NAME": #Name of the blockchain
+    module: main #Entrypoint to the project
+    moduleArgs:
+      lib.ft3.core:
+        my_blockchain_name: "YOUR_DAPP_NAME"
+        my_blockchain_website: "YOUR_DAPP_WEBSITE"
+        my_blockchain_description: "YOUR_DAPP_DESCRIPTION"
+        rate_limit_active: 1
+        rate_limit_max_points: 10
+        rate_limit_recovery_time: 30000
+        rate_limit_points_at_account_creation: 1
+
+compile:
+  rellVersion: 0.11.0

@@ -1,0 +1,19 @@
+entity quiz {
+    account_id: byte_array;
+   	uuid: text;
+}
+
+entity quiz_response {
+	uuid: text;
+	question: text;
+	answer: text;
+}
+
+
+operation persist_answer (account_id: byte_array, uuid: text, questions: list<text>, answers: list<text>) {
+    require(questions.size() == answers.size(),"Questions and Answers are not of same length");
+    for (x in range(questions.size())) {
+		create quiz_response (uuid, question=questions[x], answer=answers[x]);
+    }
+    create quiz (account_id, uuid);
+}

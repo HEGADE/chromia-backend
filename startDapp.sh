@@ -1,0 +1,1 @@
+./postchain/bin/run-node.sh dev -W
